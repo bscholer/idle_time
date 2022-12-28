@@ -1,10 +1,12 @@
 import ctypes
 import ctypes.util
 import logging
+import os
 from typing import Any, List, Type
 
 from jeepney import DBusAddress, new_method_call
 from jeepney.integrate.blocking import connect_and_authenticate
+from jeepney.wrappers import DBusErrorResponse
 
 logger = logging.getLogger(name="idle_time")
 
@@ -28,9 +30,13 @@ class IdleMonitor:
         """
         for monitor_class in cls.subclasses:
             try:
-                return monitor_class(**kwargs)
+                m = monitor_class(**kwargs)
+                # in some cases, the monitor will successfully initialize but not be usable. test that it works before returning it.
+                m.get_idle_time()
+                logger.info("Using %s", monitor_class.__name__)
+                return m
             except Exception:
-                logger.warning("Could not load %s", monitor_class, exc_info=True)
+                logger.warning("Trying other montiors, could not load %s", monitor_class, exc_info=True)
         raise RuntimeError("Could not find a working monitor.")
 
     def get_idle_time(self) -> float:
@@ -75,6 +81,10 @@ class GnomeWaylandIdleMonitor(IdleMonitor):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
+        # check that GNOME is running before trying to use it.
+        if "GNOME" not in os.environ.get("XDG_CURRENT_DESKTOP", ""):
+            raise RuntimeError("Gnome is not running.")
+
         address = DBusAddress(
             "/org/gnome/Mutter/IdleMonitor/Core",
             bus_name="org.gnome.Mutter.IdleMonitor",
@@ -84,9 +94,18 @@ class GnomeWaylandIdleMonitor(IdleMonitor):
         self.message = new_method_call(address, "GetIdletime")
 
     def get_idle_time(self) -> float:
-        reply = self.connection.send_and_get_reply(self.message)
-        idle_time = reply[0]
-        return idle_time / 1000
+        # creating the connection in the constructor will work if GNOME isn't running, but calling connection.send_and_get_reply() will fail
+        # ideally the check that GNOME is running will prevent this from happening, but more robust error handling never hurts.
+        try:
+            reply = self.connection.send_and_get_reply(self.message)
+            idle_time = reply[0]
+            return idle_time / 1000
+        except DBusErrorResponse as e:
+            # close the connection and raise a more descriptive error
+            self.connection.close()
+            if e.name == "org.freedesktop.DBus.Error.ServiceUnknown":
+                raise RuntimeError("Gnome Mutter is not available, is gnome running?") from e
+            raise
 
 
 class X11IdleMonitor(IdleMonitor):
